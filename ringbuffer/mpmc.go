@@ -1,20 +1,21 @@
 package ringbuffer
 
 import (
+	"math"
 	"runtime"
 	"sync/atomic"
 )
 
 type RingBuffer[T any] struct {
 	size         int64
-	capacity     int64
-	writeIndex   int64
-	readIndex    int64
-	maxReadIndex int64
+	capacity     uint64
+	writeIndex   uint64
+	readIndex    uint64
+	maxReadIndex uint64
 	element      []T
 }
 
-func NewRingBuffer[T any](capacity int64) *RingBuffer[T] {
+func NewRingBuffer[T any](capacity uint64) *RingBuffer[T] {
 	return &RingBuffer[T]{
 		size:         0,
 		capacity:     capacity,
@@ -25,7 +26,7 @@ func NewRingBuffer[T any](capacity int64) *RingBuffer[T] {
 	}
 }
 
-func (this *RingBuffer[T]) toIndex(index int64) int64 {
+func (this *RingBuffer[T]) toIndex(index uint64) uint64 {
 	return index % this.capacity
 }
 
@@ -36,24 +37,36 @@ func (this *RingBuffer[T]) toIndex(index int64) int64 {
 
 func (this *RingBuffer[T]) Push(element T) bool {
 	// 获取可写位置
-	var currWriteIndex int64
-	var currReadIndex int64
+	var currWriteIndex uint64
+	var currReadIndex uint64
 	for {
-		currWriteIndex = atomic.LoadInt64(&this.writeIndex)
-		currReadIndex = atomic.LoadInt64(&this.readIndex)
-		// 是否满队
-		if !(currWriteIndex >= currReadIndex && currWriteIndex-currReadIndex <= this.capacity-1) {
-			return false
+
+		// 顺序一致，不可调换顺序
+		currReadIndex = atomic.LoadUint64(&this.readIndex)
+		currWriteIndex = atomic.LoadUint64(&this.writeIndex)
+
+		// 检查是否满队
+		if currWriteIndex < currReadIndex {
+			// 处理回环的情况
+			if (math.MaxInt64-currReadIndex+1)+currWriteIndex >= this.capacity-1 {
+				return false
+			}
+		} else {
+			if currWriteIndex-currReadIndex >= this.capacity-1 {
+				return false
+			}
 		}
-		if atomic.CompareAndSwapInt64(&this.writeIndex, currWriteIndex, (currWriteIndex + 1)) {
+
+		if atomic.CompareAndSwapUint64(&this.writeIndex, currWriteIndex, (currWriteIndex + 1)) {
 			break
 		}
 	}
+
 	// 写入该位置
-	this.element[this.toIndex(currWriteIndex)]=element
+	this.element[this.toIndex(currWriteIndex)] = element
 
 	// 更新最大可读index
-	for !atomic.CompareAndSwapInt64(&this.maxReadIndex, currWriteIndex, (currWriteIndex + 1)) {
+	for !atomic.CompareAndSwapUint64(&this.maxReadIndex, currWriteIndex, (currWriteIndex + 1)) {
 		// 因为需要每个writer按顺序提交maxReadIndex，所以需要让出cpu，防止死锁
 		runtime.Gosched()
 	}
@@ -65,20 +78,30 @@ func (this *RingBuffer[T]) Push(element T) bool {
 
 func (this *RingBuffer[T]) Pop() (T, bool) {
 	// 检测是否为空
-	var currReadIndex int64
-	var currMaxReadIndex int64
+	var currReadIndex uint64
+	var currMaxReadIndex uint64
 	var res T
 	for {
-		currReadIndex = atomic.LoadInt64(&this.readIndex)
-		currMaxReadIndex = atomic.LoadInt64(&this.maxReadIndex)
+		// 顺序一致，不可调换顺序，必须currReadIndex<=currMaxReadIndex
+		currReadIndex = atomic.LoadUint64(&this.readIndex)
+		currMaxReadIndex = atomic.LoadUint64(&this.maxReadIndex)
 
-		if currReadIndex >= currMaxReadIndex {
+		// // 检查是否为空
+		// if currReadIndex == currMaxReadIndex {
+		// 	return res, false
+		// }
+		// // 检查是否发生回环
+		// if currReadIndex>currMaxReadIndex{
+		// 	// 发生回环
+		// }
+		// 上面代码等效于
+		if currReadIndex == currMaxReadIndex {
 			return res, false
 		}
 
 		res = this.element[this.toIndex(currReadIndex)]
 
-		if atomic.CompareAndSwapInt64(&this.readIndex, currReadIndex, currReadIndex+1) {
+		if atomic.CompareAndSwapUint64(&this.readIndex, currReadIndex, currReadIndex+1) {
 			break
 		}
 	}
